@@ -1,14 +1,14 @@
 # CogVLM Stand Alone Script
 
-This is a basic script you can use to run [CogVLM2](https://github.com/THUDM/CogVLM2) locally. It uses 4-bit quantization by default to minimize VRAM requirements and provides several modes of interaction.
+This is a basic script you can use to run [CogVLM2](https://github.com/THUDM/CogVLM2) locally. It uses 4-bit quantization by default (on CUDA devices) to minimize VRAM requirements and provides several modes of interaction, with **interactive chat as the default mode**.
 
 ## Features
 
 *   **Multiple Modes:**
-    *   Interactive Chat (`--interactive`)
+    *   Interactive Chat (`--interactive`, **Default**)
     *   Image Captioning (`--caption`)
-    *   JSON Output Demo (`--json-demo`, default)
-*   **Interactive Chat:**
+    *   JSON Output Demo (`--json-demo`)
+*   **Interactive Chat (Default Mode):**
     *   Chat History
     *   Load images during chat (`/open`)
     *   View image info (`/image`)
@@ -16,7 +16,7 @@ This is a basic script you can use to run [CogVLM2](https://github.com/THUDM/Cog
     *   Reset chat and image (`/reset`)
     *   Customizable user/assistant names
     *   Help command (`/help`)
-*   **JSON Features:**
+*   **JSON Features (via `--json-demo`):**
     *   Prompt for JSON output.
     *   Extract JSON from model response.
     *   Validate JSON against a provided schema.
@@ -37,10 +37,10 @@ This is a basic script you can use to run [CogVLM2](https://github.com/THUDM/Cog
 4.  Activate Environment: `source .venv/bin/activate`
 5.  Install Python Requirements: `pip install -r requirements.txt`
 6.  Run Examples:
-    *   JSON Demo (Default): `python CogVLM.py`
-    *   JSON Demo with specific image: `python CogVLM.py --image <path_or_url_to_image>`
-    *   Interactive Chat: `python CogVLM.py --interactive`
-    *   Interactive Chat starting with an image: `python CogVLM.py --interactive --image <path_or_url_to_image>`
+    *   **Interactive Chat (Default):** `python CogVLM.py`
+    *   Interactive Chat starting with an image: `python CogVLM.py --image <path_or_url_to_image>`
+    *   JSON Demo: `python CogVLM.py --json-demo`
+    *   JSON Demo with specific image: `python CogVLM.py --json-demo --image <path_or_url_to_image>`
     *   Generate Caption: `python CogVLM.py --caption --image <path_or_url_to_image>`
 
 ## Note on Transformers Library Versions
@@ -210,7 +210,7 @@ Resets the chat session by clearing both the conversation history and the curren
 
 ##### `start_cmd_chat(self)`
 
-Starts an interactive command-line chat session.
+Starts an interactive command-line chat session. This is the default mode of operation.
 
 - **Arguments:** None.
 - **Returns:** None.
@@ -248,7 +248,7 @@ Performs inference using the loaded CogVLM model.
 - **Arguments:**
   - `query` (str): The main text query or prompt.
   - `system_prmpt` (str, optional): A system prompt to prepend to the conversation. Defaults to `None`.
-  - `images` (list, optional): A list containing image sources (paths, URLs, or PIL Images). Currently, only the first image is used if multiple are provided. Defaults to `None`.
+  - `images` (list, optional): A list containing image sources (paths, URLs, or PIL Images). Only the first image is used if multiple are provided. Defaults to `None`.
   - `history` (list, optional): A list of `(name, message)` tuples representing the conversation history. Defaults to `None` (starts a new conversation).
   - `max_new_tokens` (int, optional): Maximum number of tokens to generate. Defaults to `2048`.
   - `pad_token_id` (int, optional): Token ID for padding. Defaults to `128002`.
@@ -257,8 +257,8 @@ Performs inference using the loaded CogVLM model.
   - `assistant_name` (str, optional): Name tag for the assistant in the current turn. Defaults to `'ASSISTANT'`.
 - **Returns:**
   - `tuple`: `(response, history)`
-    - `response` (str): The generated text response from the model.
-    - `history` (list): The updated conversation history including the latest query and response.
+    - `response` (str): The generated text response from the model, or an error message on failure.
+    - `history` (list): The updated conversation history including the latest query and response (or the history before the failed turn).
 - **Notes:**
   - Handles image loading and preprocessing if `images` are provided.
   - Formats the input prompt including system prompt, history, and current query.
@@ -278,18 +278,18 @@ Factory method to create a `CogVLMChat` instance associated with this `CogVLM` m
 
 ##### `generate_caption(self, image, query='Describe what you see in the image below. Write a concise, descriptive caption at least 10 words long.')`
 
-A convenience method to generate a caption for a single image.
+A convenience method to generate a caption for a single image (used by `--caption` mode).
 
 - **Arguments:**
   - `image` (Union[str, `PIL.Image.Image`]): The image to caption.
   - `query` (str, optional): The prompt used to request the caption. Defaults to a descriptive prompt.
 - **Returns:**
   - `str`: The generated caption.
-  - `None`: If the input `image` is `None`.
+  - `None`: If the input `image` is `None` or an error occurs.
 
 ##### `request_json(self, query, image=None, extract=False, schema=None, validate_schema=False, max_retries=0)`
 
-Requests a response from the model, optionally extracting JSON, validating it against a schema, and retrying on failure.
+Requests a response from the model, optionally extracting JSON, validating it against a schema, and retrying on failure (used by `--json-demo` mode).
 
 - **Arguments:**
   - `query` (str): The user's query, intended to elicit a JSON response.
@@ -321,15 +321,15 @@ Parses command-line arguments using `argparse`.
 - **Returns:**
   - `argparse.Namespace`: An object containing the parsed arguments.
 - **Arguments:**
-    - `--json-demo`: Run the JSON demo (default if no other mode is specified).
-    - `--interactive`: Start interactive chat mode.
+    - `--json-demo`: Run the JSON demo.
+    - `--interactive`: Start interactive chat mode (this is the **default** mode if no other mode is specified).
     - `--caption`: Generate a caption for an image (requires `--image`).
-    - `--model-path`: Path to the model (default: `THUDM/cogvlm2-llama3-chat-19B`).
+    - `--model-path`: Path or HuggingFace ID of the model (default: `THUDM/cogvlm2-llama3-chat-19B`).
     - `--image`: Path or URL to an image (used by `--caption`, `--interactive`, `--json-demo`).
     - `--schema`: Path to a JSON schema file (used by `--json-demo`).
     - `--query`: Query to send to the model (used by `--caption`, `--json-demo`).
     - `--retries`: Number of retries for JSON validation (used by `--json-demo`, default: 3).
-    - `--verbose`/`-v`: Increase logging verbosity (can use `-v` or `-vv`).
+    - `--verbose`/`-v`: Increase logging verbosity (-v for INFO, -vv for DEBUG).
     - `--user-name`: Name for the user in chat (default: `USER`).
     - `--assistant-name`: Name for the assistant in chat (default: `ASSISTANT`).
 
@@ -342,11 +342,11 @@ Configures the root logger based on the verbosity level provided by command-line
 
 #### `main()`
 
-The main entry point of the script. It parses arguments, sets up logging, initializes the `CogVLM` model, and runs the selected mode (`json-demo`, `interactive`, or `caption`).
+The main entry point of the script. It parses arguments, sets up logging, initializes the `CogVLM` model, and runs the selected mode. If no mode (`--json-demo`, `--interactive`, `--caption`) is explicitly specified, it **defaults to running the interactive chat mode** (`--interactive`).
 
 #### `run_json_demo(cogVLM, image=None, schema=None, query=None, retries=3)`
 
-Runs the JSON demonstration mode. It uses default values for image, schema, and query if none are provided. It calls `cogVLM.request_json` with extraction and validation enabled.
+Runs the JSON demonstration mode **when explicitly requested via the `--json-demo` argument**. It uses default values for image, schema, and query if none are provided via command-line arguments. It calls `cogVLM.request_json` with extraction and validation enabled.
 
 - **Arguments:**
   - `cogVLM` (`CogVLM`): The initialized CogVLM model instance.
