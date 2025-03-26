@@ -96,7 +96,6 @@ def load_image(image: Union[str, Image.Image]) -> Image.Image:
             f"but got {type(image)}"
         )
 
-
 class CogVLMChat:
     def __init__(self, model, user_name="USER", assistant_name="ASSISTANT"):
         self.model = model
@@ -243,7 +242,6 @@ class CogVLMChat:
                 _logger.error(f"Error during model inference: {e}")
                 print("ASSISTANT: Sorry, an error occurred while generating the response.")
 
-
 class CogVLM:
     def __init__(self, model_path="THUDM/cogvlm2-llama3-chat-19B"):
         self.model_path = model_path
@@ -275,7 +273,6 @@ class CogVLM:
         else:
             self.logger.info("CPU detected, loading model without quantization.")
 
-
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
             torch_dtype=self.TORCH_TYPE,
@@ -296,11 +293,8 @@ class CogVLM:
         top_k=1,
         user_name="USER",
         assistant_name="ASSISTANT",
+        seed_response=""
     ):
-        self.logger.debug(
-            f"Running inference with args: query: {query}, images: {images is not None}, system_prmpt: {system_prmpt is not None}, history_len: {len(history) if history else 0}, max_new_tokens: {max_new_tokens}, pad_token_id: {pad_token_id}, top_k: {top_k}"
-        )
-
         processed_images = None
         if images is not None:
             if len(images) > 1:
@@ -323,51 +317,36 @@ class CogVLM:
         # Create a temporary history copy for this inference call if needed,
         # or modify the original history list directly.
         # Current implementation modifies the original history list passed in.
-        current_turn_history = history + [(user_name, query)]
+        history += [(user_name, query)]
 
         # Build the prompt string from history
         prompt = "" if system_prmpt is None else system_prmpt + "\n"
-        for name, message in current_turn_history:
+        for name, message in history:
             prompt += f"{name}: {message}\n"
-        prompt += f"{assistant_name}:" # Add assistant tag to prompt generation
+        prompt += f"{assistant_name}:{seed_response}" # Add assistant tag to prompt generation
 
-        self.logger.debug(f"Formatted Prompt:\n{prompt}")
+        self.logger.debug(f"[[ Formatted Prompt ]]\n{prompt}")
 
         try:
             input_by_model = self.model.build_conversation_input_ids(
                 self.tokenizer,
-                query=query, # Pass the current query separately
-                history=history, # Pass the history *before* the current query
-                images=processed_images, # Pass the processed PIL image(s)
-                template_version="base",
-                system=system_prmpt # Pass system prompt if available
+                query=prompt,
+                images=processed_images,
+                template_version='base'
             )
 
             inputs = {
-                "input_ids": input_by_model["input_ids"]
-                .unsqueeze(0)
-                .to(self.DEVICE),
-                "token_type_ids": input_by_model["token_type_ids"]
-                .unsqueeze(0)
-                .to(self.DEVICE),
-                "attention_mask": input_by_model["attention_mask"]
-                .unsqueeze(0)
-                .to(self.DEVICE),
-                "images": [
-                    [img.to(self.DEVICE).to(self.TORCH_TYPE) for img in input_by_model["images"]]
-                ]
-                if processed_images is not None and input_by_model.get("images")
-                else None,
+                'input_ids': input_by_model['input_ids'].unsqueeze(0).to(self.DEVICE),
+                'token_type_ids': input_by_model['token_type_ids'].unsqueeze(0).to(self.DEVICE),
+                'attention_mask': input_by_model['attention_mask'].unsqueeze(0).to(self.DEVICE),
+                #'images': [[input_by_model['images'][0].to(self.DEVICE).to(self.TORCH_TYPE)]] if images is not None else None,
+                'images': [[image.to(self.DEVICE).to(self.TORCH_TYPE) for image in input_by_model['images']]] if images is not None else None,
             }
-
-            # Filter out None values from inputs dictionary if images are not present
-            inputs = {k: v for k, v in inputs.items() if v is not None}
 
             gen_kwargs = {
                 "max_new_tokens": max_new_tokens,
                 "pad_token_id": pad_token_id,
-                "top_k": top_k,
-                "do_sample": False, # Ensure deterministic output for top_k=1
+                "top_k": top_k
             }
 
             with torch.no_grad():
@@ -375,13 +354,12 @@ class CogVLM:
                 # Slice outputs to get only the generated tokens
                 generated_ids = outputs[:, inputs["input_ids"].shape[1] :]
                 response = self.tokenizer.decode(generated_ids[0])
-                response = response.split("<|end_of_text|>")[0].strip()
+                response = seed_response + response.split("<|end_of_text|>")[0].strip()
 
             # Append the successful query and response to the original history
-            history.append((user_name, query))
             history.append((assistant_name, response))
 
-            self.logger.debug(f"Raw Response: {response}")
+            self.logger.debug(f"[[ Raw Response ]]\n{response}")
             return response, history
 
         except Exception as e:
@@ -401,14 +379,17 @@ class CogVLM:
     def generate_caption(
         self,
         image,
-        query="Describe what you see in the image below. Write a concise, descriptive caption at least 10 words long.",
+        query=None,
     ):
+        if not query:
+            query="Describe what you see in the image below. Write a concise, descriptive caption at least 10 words long."
+
         if image is None:
             self.logger.error("Image is None, cannot generate caption.")
             return None
         try:
             # Use inference with no history and the provided image/query
-            response, _ = self.inference(query, images=[image], history=[])
+            response, _ = self.inference(query, images=[image])
             return response
         except Exception as e:
             self.logger.error(f"Error generating caption: {e}")
@@ -448,7 +429,7 @@ class CogVLM:
                 else:
                     raise TypeError("Schema must be a dict or a JSON string.")
 
-                system_prmpt += f"\nResponse must conform to the following JSON Schema:\n{json.dumps(schema_dict)}"
+                system_prmpt += f"\nResponse must conform to the following JSON Schema:\n```json\n{json.dumps(schema_dict)}\n```"
                 loaded_schema = schema_dict # Use the loaded dict for validation
 
             except (json.JSONDecodeError, TypeError) as e:
@@ -469,6 +450,7 @@ class CogVLM:
                 images=[image] if image else None,
                 system_prmpt=system_prmpt,
                 history=current_history, # Pass the evolving history
+                seed_response="\n```json\n{"
             )
             last_raw_response = response # Update last raw response
 
@@ -481,15 +463,11 @@ class CogVLM:
             if not extracted_json:
                 self.logger.warning(f"Attempt {attempt + 1}: Failed to extract JSON from response.")
                 if attempt < max_retries:
-                    current_query = f"The previous response was not valid JSON or no JSON was found. Please provide a response strictly in JSON format. Your previous response started with: '{response[:100]}...'"
-                    # Do not add the failed response to history for the next prompt,
-                    # but keep the history leading up to the failure.
-                    # Remove the last assistant response if it was added by inference()
-                    if current_history and current_history[-1][0] == self.model.assistant_name: # Check if inference added assistant response
-                         current_history.pop()
-                    # Remove the user query that led to the failure
-                    if current_history and current_history[-1][0] == self.model.user_name:
-                         current_history.pop()
+                    current_query = f"The previous response was not valid JSON or no JSON was found. Please provide a response strictly in JSON format."
+                    if len(response) > 0:
+                        current_query += f"Your previous response started with: '{response[:100]}...'"
+                    else:
+                        current_query += "Your previous response was blank"
                     continue # Retry
                 else:
                     self.logger.error("Max retries reached. Failed to extract JSON.")
@@ -517,11 +495,6 @@ class CogVLM:
                 )
                 if attempt < max_retries:
                     current_query = f"The previous JSON response was invalid according to the schema. Error: '{error_message}'. Please correct the JSON structure and content to match the required schema."
-                    # As before, clean history for the retry prompt
-                    if current_history and current_history[-1][0] == self.model.assistant_name:
-                         current_history.pop()
-                    if current_history and current_history[-1][0] == self.model.user_name:
-                         current_history.pop()
                     continue # Retry
                 else:
                     self.logger.error(
@@ -530,12 +503,11 @@ class CogVLM:
                     return None, last_raw_response # Failed after retries
 
         # Should not be reached, but as a fallback
-        self.logger.error("Exited retry loop unexpectedly.")
+        self.logger.error("Ran out of retries. failed to get valid resposne.")
         return None, last_raw_response
 
-
 def run_json_demo(
-    cogVLM, image=None, schema=None, query=None, retries=3
+    cogVLM, image=None, schema=None, query=None, retries=0
 ):
     _logger.info("--- Starting JSON Demo ---")
     if not image:
@@ -574,7 +546,7 @@ def run_json_demo(
         }
 
     if not query:
-        default_query = "Analyze the image and provide a JSON response containing a caption, any text found via OCR, and a list of detected objects. Ensure the response strictly follows the provided JSON schema."
+        default_query = "Write a detailed description of the image. Make sure to fill in all fields."
         _logger.info(f"No query provided, using default: '{default_query}'")
         query = default_query
 
@@ -649,7 +621,7 @@ def parse_arguments():
     parser.add_argument(
         "--retries",
         type=int,
-        default=3,
+        default=0,
         help="Number of retries for JSON validation (used by --json-demo)",
     )
 
@@ -741,9 +713,8 @@ def main():
 
             try:
                 # generate_caption handles image loading internally
-                caption = cogVLM.generate_caption(
-                    args.image, args.query if args.query else None
-                )
+                caption = cogVLM.generate_caption(args.image, query=args.query)
+                
                 if caption:
                     print(f"\nCaption:\n{caption}\n")
                 else:
