@@ -1,6 +1,6 @@
 import logging
 import random
-
+import argparse
 import json
 from jsonschema import validate, ValidationError
 
@@ -95,6 +95,7 @@ class CogVLMChat:
         self.assistant_name = assistant_name
         self.history = []
         self.image = None
+        self.image_path = None  # Store the path or URL of the loaded image
     
     def chat(self, query):
         response, self.history = self.model.inference(
@@ -104,26 +105,115 @@ class CogVLMChat:
         )
         return response
     
-    def chat_with_image(self, image, query = 'Describe what you see in the image below. Write a concise, descriptive caption at least 10 words long.'):
-        self.image = image
-        return self.chat(query)
+    def open_image(self, image_path):
+        """
+        Opens an image from a file path or URL and sets it as the current image.
+        
+        Args:
+            image_path (str): Path or URL to the image
+            
+        Returns:
+            tuple: (success, message) where success is a boolean indicating if the operation
+                  was successful, and message is a string with information about the result
+        """
+        try:
+            img = load_image(image_path)
+            img = img.convert("RGB")
+            self.image = img
+            self.image_path = image_path  # Save the image path
+            return True, f"Successfully opened image: {image_path} ({img.size[0]}x{img.size[1]})"
+        except FileNotFoundError:
+            return False, f"Image file not found: {image_path}"
+        except requests.exceptions.RequestException as e:
+            return False, f"Error downloading image: {str(e)}"
+        except Exception as e:
+            return False, f"Error processing image: {str(e)}"
+    
+    def get_image_info(self):
+        """
+        Returns information about the currently loaded image.
+        
+        Returns:
+            str: Information about the image or a message if no image is loaded
+        """
+        if self.image is None:
+            return "No image is currently loaded"
+        
+        # Include the image path in the information
+        path_info = f"Path: {self.image_path}" if self.image_path else "Path: Unknown (loaded directly)"
+        return f"Current image: {self.image.size[0]}x{self.image.size[1]} pixels, mode: {self.image.mode}\n{path_info}"
+    
+    def clear_history(self):
+        """Clears the chat history"""
+        self.history = []
+        return "Chat history cleared"
+    
+    def reset(self):
+        """Resets both the image and chat history"""
+        self.history = []
+        self.image = None
+        self.image_path = None  # Also reset the image path
+        return "Chat history and image have been reset"
     
     def start_cmd_chat(self):
+        print("Interactive chat started. Type /help for available commands.")
+        
+        # Define available commands and their help text
+        commands = {
+            "/help": "Show this help message",
+            "/exit": "Exit the chat",
+            "/open [path]": "Open an image from a file path or URL",
+            "/clear": "Clear the chat history",
+            "/image": "Show information about the currently loaded image",
+            "/reset": "Reset the image and chat history"
+        }
+        
         while True:
             query = input(f"{self.user_name}: ")
-            if query.lower() == "exit":
-                break
-            if query.lower().startswith("open "):
-                image_path = query[5:].strip()
-                try:
-                    self.image = Image.open(image_path)
-                    self.image = self.image.convert("RGB")
-                    print(f"Opened image: {image_path}")
-                except FileNotFoundError:
-                    logging.error(f"Image file not found: {image_path}")
-                except Exception as e:
-                    logging.error(f"Error processing image: {e}")
-                continue
+            
+            # Handle commands (starting with /)
+            if query.startswith('/'):
+                cmd_parts = query.split(' ', 1)
+                cmd = cmd_parts[0].lower()
+                args = cmd_parts[1] if len(cmd_parts) > 1 else ""
+                
+                if cmd == "/exit":
+                    print("Exiting chat...")
+                    break
+                
+                elif cmd == "/help":
+                    print("\nAvailable commands:")
+                    for command, description in commands.items():
+                        print(f"  {command:<15} - {description}")
+                    print()
+                    continue
+                
+                elif cmd == "/open":
+                    if not args:
+                        print("Error: Please provide a path or URL to an image")
+                        continue
+                    
+                    success, message = self.open_image(args.strip())
+                    print(message)
+                    continue
+                
+                elif cmd == "/clear":
+                    print(self.clear_history())
+                    continue
+                
+                elif cmd == "/image":
+                    print(self.get_image_info())
+                    continue
+                
+                elif cmd == "/reset":
+                    print(self.reset())
+                    continue
+                
+                else:
+                    print(f"Unknown command: {cmd}. Type /help for available commands.")
+                    continue
+            
+            # Regular chat message
             print(f"{self.assistant_name}: {self.chat(query)}")
 
 class CogVLM:
@@ -283,15 +373,18 @@ class CogVLM:
         self.logger.error(f"Max retries reached. Returning None and raw response.")
         return None, response
 
-def main():
-    logging.basicConfig(level=logging.DEBUG)
-    cogVLM = CogVLM()
+def run_json_demo(
+    cogVLM,
+    image=None,
+    schema=None,
+    query=None,
+    retries=3
+):
+    if not image:
+        image = "https://www.contracosta.ca.gov/ImageRepository/Document?documentId=85645"
 
-    images = [
-        "https://www.contracosta.ca.gov/ImageRepository/Document?documentId=85645"
-    ]
-
-    schema = {
+    if not schema:
+        schema = {
         "type": "object",
         "properties": {
             "caption": {
@@ -318,20 +411,113 @@ def main():
         "required": ["caption", "ocr", "objects"],
         "description": "Schema for an object describing an image.  It includes a text description, OCR results, and detected objects.",
     }
+        
+    if not query:
+        query = "write a description of the image. Make sure to fill in all fields."
 
-    query = "write a description of the image. Make sure to fill in all fields."
+    response, raw_response = cogVLM.request_json(
+        query,
+        image=image,
+        extract=True,
+        schema=schema,
+        validate_schema=True,
+        max_retries=retries)
+    
+    print(f"\n[ Raw Response ]\n{raw_response}\n\n[ JSON Response ]\n{response}\n\n")
 
-    for image in images[:1]:
-        response, raw_response = cogVLM.request_json(
-            query,
-            image=image,
-            extract=True,
-            schema=schema,
-            validate_schema=True,
-            max_retries=3)
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='CogVLM Image Analysis Tool')
+    
+    # Main operation modes
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument('--json-demo', action='store_true', help='Run the JSON demo')
+    mode_group.add_argument('--interactive', action='store_true', help='Start interactive chat mode')
+    mode_group.add_argument('--caption', action='store_true', help='Generate a caption for an image')
+    
+    # Model configuration
+    parser.add_argument('--model-path', type=str, default='THUDM/cogvlm2-llama3-chat-19B', 
+                        help='Path to the model')
+    
+    # Image input
+    parser.add_argument('--image', type=str, help='Path or URL to an image')
+    
+    # JSON demo options
+    parser.add_argument('--schema', type=str, help='JSON schema file path')
+    parser.add_argument('--query', type=str, help='Query to send to the model')
+    parser.add_argument('--retries', type=int, default=3, help='Number of retries for JSON validation')
+    
+    # Logging options
+    parser.add_argument('--verbose', '-v', action='count', default=0, 
+                        help='Increase verbosity (can be used multiple times)')
+    
+    # Chat options
+    parser.add_argument('--user-name', type=str, default='USER', help='Name for the user in chat')
+    parser.add_argument('--assistant-name', type=str, default='ASSISTANT', help='Name for the assistant in chat')
+    
+    return parser.parse_args()
 
-        #print(f"{image}:\njson: {extract_json(response)}\n\nRaw: {response}")
-        return
+def setup_logging(verbosity):
+    log_levels = {
+        0: logging.WARNING,
+        1: logging.INFO,
+        2: logging.DEBUG
+    }
+    # If verbosity is higher than the max level, use the highest level
+    level = log_levels.get(min(verbosity, max(log_levels.keys())), logging.DEBUG)
+    logging.basicConfig(level=level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+def main():
+    args = parse_arguments()
+    setup_logging(args.verbose)
+    
+    # Initialize the model
+    cogVLM = CogVLM(model_path=args.model_path)
+    
+    # Determine which mode to run
+    if args.json_demo:
+        # Load schema from file if provided
+        schema_data = None
+        if args.schema:
+            try:
+                with open(args.schema, 'r') as f:
+                    schema_data = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError) as e:
+                _logger.error(f"Error loading schema file: {e}")
+                return
+        
+        run_json_demo(
+            cogVLM,
+            image=args.image,
+            schema=schema_data,
+            query=args.query,
+            retries=args.retries
+        )
+    
+    elif args.caption:
+        if not args.image:
+            _logger.error("Image path or URL is required for caption generation")
+            return
+        
+        try:
+            image = load_image(args.image)
+            caption = cogVLM.generate_caption(image, args.query if args.query else None)
+            print(f"Caption: {caption}")
+        except Exception as e:
+            _logger.error(f"Error generating caption: {e}")
+    
+    elif args.interactive:
+        chat = cogVLM.create_chat(user_name=args.user_name, assistant_name=args.assistant_name)
+        
+        # If image is provided, load it first
+        if args.image:
+            success, message = chat.open_image(args.image)
+            print(message)
+
+        chat.start_cmd_chat()
+    
+    else:
+        # Default to JSON demo if no mode specified
+        run_json_demo(cogVLM)
 
 if __name__ == '__main__':
     main()
