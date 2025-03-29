@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cogvlm"
+authors = [
+    {name = "Nick Spinner", email = "spinnernicholas@gmail.com"}
+]
+description = "Wrapper for CogVLM2"
+version = "0.1.0"
+dependencies = [
+    'accelerate>=1.5.2',
+    'argparse',
+    'bitsandbytes>=0.45.4',
+    'einops>=0.8.1',
+    'jsonschema>=4.23.0',
+    'numpy>=2.2.4',
+    'requests>=2.32.3',
+    'torch>=2.6.0',
+    'torchvision>=0.21.0',
+    'transformers==4.48.3',
+    'xformers'
+]
+
+[project.optional-dependencies]
+dev = []
