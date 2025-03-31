@@ -1,7 +1,7 @@
 import logging
 import requests
 from io import BytesIO
-from typing import List, Optional, Tuple, Union, Any, Iterator, Callable
+from typing import List, Optional, Tuple, Union, Any, Iterator, Callable, Protocol
 from abc import ABC, abstractmethod
 from PIL import Image
 import base64
@@ -73,11 +73,14 @@ def load_image(image: Union[str, Image.Image]) -> Image.Image:
             f"but got {type(image)}"
         )
 
-class ICogVLM(ABC):
+class ICogVLM(Protocol):
     """
-    Abstract base class for CogVLM models.
+    Protocol defining the interface for a CogVLM-like model interaction.
+
+    This protocol ensures that any class implementing it provides a consistent
+    `inference` method for generating responses based on text, optional images,
+    and conversation history.
     """
-    @abstractmethod
     def inference(
         self,
         query: str,
@@ -90,28 +93,53 @@ class ICogVLM(ABC):
         assistant_name: str = "ASSISTANT",
         seed_response: str = "",
         stream: bool = False,
-    ) -> Union[Tuple[str, List[Tuple[str, str]]], Tuple[Iterator[str], Callable]]:
+    ) -> Union[Tuple[str, List[Tuple[str, str]]], Tuple[Iterator[str], Callable[[], Tuple[str, List[Tuple[str, str]]]]]]:
         """
-        Abstract inference method to be implemented by subclasses.
+        Performs inference using the model based on the provided inputs.
+
+        This method handles generating a response from the model, potentially
+        considering multimodal inputs (text and images) and conversation context.
+        It supports both standard single-response generation and streaming output.
 
         Args:
-            query (str): The user's query.
-            system_prmpt (Optional[str]):  Optional system prompt.
-            images (Optional[List[Union[str, Image.Image]]]): List of image paths/URLs/PIL Images.
-            history (Optional[List[Tuple[str, str]]]): Conversation history.
-            max_new_tokens (int): Maximum number of new tokens to generate.
-            top_k (int): Top-k sampling parameter.
-            user_name (str): Name for the user role.
-            assistant_name (str): Name for the assistant role.
-            seed_response (str): Optional text to seed the assistant's response.
-            stream (bool): If True, return an iterator that yields tokens as they're generated.
+            query: The primary text input or question from the user.
+            system_prmpt: An optional instruction or context provided to the
+                model, separate from the user query and history. Defaults to None.
+            images: An optional list containing image inputs. Each element can
+                be a file path (str), a URL (str), or a PIL Image object.
+                Defaults to None.
+            history: An optional list of tuples representing the conversation
+                history. Each tuple should be (role, message), e.g.,
+                [("USER", "Hello"), ("ASSISTANT", "Hi there!")]. Defaults to None.
+            max_new_tokens: The maximum number of tokens to generate in the
+                response. Defaults to 2048.
+            top_k: The number of highest probability vocabulary tokens to keep
+                for top-k-filtering. Defaults to 1 (greedy decoding).
+            user_name: The identifier string used for the user's role in the
+                history and potentially in prompt formatting. Defaults to "USER".
+            assistant_name: The identifier string used for the model's role.
+                Defaults to "ASSISTANT".
+            seed_response: Optional text provided to the model to guide or
+                start its response generation. Defaults to "".
+            stream: If False (default), generates the full response at once.
+                If True, returns an iterator yielding tokens incrementally.
 
         Returns:
-            Union[Tuple[str, List[Tuple[str, str]]], Tuple[Iterator[str], Callable]]:
-                If stream=False: (response, updated_history)
-                If stream=True: (token_iterator, finalizer_function)
+            If stream is False:
+                A tuple containing:
+                    - response (str): The complete generated response text.
+                    - updated_history (List[Tuple[str, str]]): The conversation
+                      history including the latest query and response.
+            If stream is True:
+                A tuple containing:
+                    - token_iterator (Iterator[str]): An iterator that yields
+                      response tokens (strings) as they are generated.
+                    - finalizer (Callable[[], Tuple[str, List[Tuple[str, str]]]]):
+                      A function that, when called after the iterator is
+                      exhausted, returns the complete response string and the
+                      updated conversation history.
         """
-        raise NotImplementedError("Subclasses must implement the inference method.")
+        ... # Protocol methods have no implementation body
 
 class CogVLM(ICogVLM):
     """

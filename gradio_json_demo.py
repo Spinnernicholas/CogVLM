@@ -1,264 +1,395 @@
-import gradio as gr
+# fmt: off
+import sys
 import logging
 import json
-from PIL import Image
-import io # Needed for image handling if sending PIL object directly
-from typing import List, Tuple, Optional, Dict, Any
+import pandas as pd
+import time
+from datetime import datetime
+from typing import Optional, Dict, Any, Iterator, List, Tuple, Union
 
-# --- Assuming client.py and json.py are accessible ---
-# If they are in subdirectories, adjust the import paths accordingly
-# e.g., from ..cogvlm.client import CogVLMClient
-# e.g., from ..dogvlm.json import request_json_stream, extract_json, validate_json_schema
-try:
-    from cogvlm import CogVLMClient, ICogVLM
-    # Import the specific streaming function and helpers
-    from cogvlm.json import request_json_stream, extract_json, validate_json_schema
-    # Import the interface for type hinting (optional but good practice)
-except ImportError as e:
-    print(f"ERROR: Could not import necessary modules: {e}")
-    print("Please ensure client.py and json.py are in the correct path.")
-    exit(1)
+# --- Basic Configuration ---
+APP_TITLE = "CogVLM JSON Request Demo"
 
-# --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# --- Logging Setup (Do this FIRST) ---
+logging.basicConfig(
+    level=logging.INFO, # Use logging.DEBUG for more verbose chat history logs
+    format="%(asctime)s - %(levelname)s - [%(name)s] - %(message)s",
+    stream=sys.stdout,
+)
 _logger = logging.getLogger(__name__)
+_logger.info(f"Starting {APP_TITLE}...")
 
-SERVER_URL = "http://localhost:8000" # CHANGE IF YOUR SERVER IS ELSEWHERE
-DEFAULT_SCHEMA = """{
-  "type": "object",
-  "properties": {
-    "summary": {
-      "type": "string",
-      "description": "A brief summary of the image content or answer."
-    },
-    "details": {
-      "type": "object",
-      "description": "Specific details extracted or generated.",
-      "properties": {
-         "keywords": {
-            "type": "array",
-            "items": {"type": "string"}
-         }
-      }
-    }
-  },
-  "required": ["summary"]
-}"""
-
-# --- Initialize Client (or create on demand) ---
-# Creating it once might be slightly more efficient if the app runs long
+# --- Import Core Libraries ---
 try:
-    client = CogVLMClient(base_url=SERVER_URL)
-    # Perform an initial health check
-    health = client.check_health()
-    if not health or health.get("status") != "ok" or not health.get("model_loaded"):
-        _logger.error(f"CogVLM server not ready at {SERVER_URL}. Health: {health}")
-        # Optionally raise an error or exit, or let Gradio handle connection errors later
-        # raise RuntimeError(f"CogVLM server not ready: {health}")
-        print(f"WARNING: CogVLM server not ready at {SERVER_URL}. Health: {health}")
-        print("The application might not function correctly.")
-    else:
-        _logger.info(f"CogVLM client connected successfully to {SERVER_URL}")
+    import gradio as gr
+    from PIL import Image
+    _logger.info("Imported Gradio and PIL.")
+except ImportError as e:
+    _logger.error(f"Missing core dependency: {e}. Please install Gradio and Pillow.")
+    sys.exit(1)
+
+# --- Import CogVLM Components ---
+try:
+    from cogvlm.core import ICogVLM
+    from cogvlm.client import CogVLMClient
+    from cogvlm.json import request_json, extract_json, validate_json_schema
+    from cogvlm.conversation_manager import conversation_manager
+
+    _logger.info("Successfully imported CogVLM components.")
+    COGVLM_AVAILABLE = True
+except ImportError as e:
+    _logger.error(f"Failed to import CogVLM components: {e}. App cannot run.")
+    COGVLM_AVAILABLE = False
+    class CogVLMClient: pass
+    def request_json(*args, **kwargs): raise ImportError("CogVLM components failed to import")
 except Exception as e:
-    _logger.error(f"Failed to initialize CogVLMClient: {e}", exc_info=True)
-    print(f"ERROR: Failed to initialize CogVLMClient targeting {SERVER_URL}.")
-    print("Ensure the server is running and the URL is correct.")
-    # Set client to None to handle gracefully later, or exit
-    client = None
-    # exit(1) # Or handle this more gracefully in the chat function
+    _logger.exception(f"An unexpected error occurred during CogVLM import: {e}")
+    COGVLM_AVAILABLE = False
+    class CogVLMClient: pass
+    def request_json(*args, **kwargs): raise ImportError("Unexpected error during CogVLM import")
 
 
-# --- Gradio Chat Function ---
-def process_chat(
-    user_query: str,
-    image_input: Optional[Image.Image], # Gradio provides PIL Image
-    schema_input: str,
-    chat_history: List[Tuple[str, str]]
-):
+# --- Main Application Logic ---
+def process_request(
+    query: str,
+    image_input: Optional[Image.Image],
+    schema_str: Optional[str],
+    validate_schema_flag: bool,
+    max_retries_input: int,
+    system_prompt_str: Optional[str],
+    extract_flag: bool,
+    seed_response_str: Optional[str],
+) -> Iterator[Dict[str, gr.update]]:
     """
-    Handles the chat interaction, calls the streaming API, and updates history.
-    Yields updates to the chatbot UI during streaming.
+    Handles the request lifecycle triggered by the Gradio button.
+    Streams chat messages (using flat list 'messages' format) including the
+    system prompt, and yields updates.
     """
-    if not client:
-        yield chat_history + [
-            (user_query, "**Error:** CogVLM Client not initialized. Cannot connect to server.")
-        ], chat_history
+    _logger.info("Processing new request...")
+
+    # 1. Initialize state
+    event_log_data: List[Dict[str, Any]] = []
+    chat_history: List[Dict[str, str]] = [] # Flat list 'messages' format
+    status = "Starting..."
+    json_output = ""
+    raw_output = ""
+    last_event_data = None
+    USER_ROLE_NAME = "user"
+    ASSISTANT_ROLE_NAME = "assistant"
+    SYSTEM_ROLE_NAME = "system"
+    initial_user_message_added = False # Flag
+
+    # Helper to yield updates
+    def yield_update(chat=None, log_df=None, stat=None, json_val=None, raw_val=None):
+        updates = {}
+        if chat is not None:
+            # Add extra logging/validation before yielding chat update
+            _logger.debug(f"Yielding chat_history update: {chat}")
+            # Basic validation (can be expanded)
+            if not isinstance(chat, list) or any(not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg for msg in chat):
+                 _logger.error(f"INVALID chat_history structure detected before yield: {chat}")
+                 # Decide how to handle: skip update, yield empty, raise error?
+                 # For now, let's skip the chat update to avoid crashing Gradio
+                 pass # Don't add chat update if invalid
+            else:
+                 updates[out_chat_log] = gr.update(value=chat)
+
+        if log_df is not None: updates[out_event_log] = gr.update(value=log_df if not log_df.empty else pd.DataFrame(columns=["Timestamp", "Event", "Raw Event"]))
+        if stat is not None: updates[out_final_status] = gr.update(value=stat)
+        if json_val is not None: updates[out_final_json] = gr.update(value=json_val)
+        if raw_val is not None: updates[out_final_raw] = gr.update(value=raw_val)
+        return updates
+
+    # Initial clear/status update
+    initial_log_df = pd.DataFrame(columns=["Timestamp", "Event", "Raw Event"])
+    yield yield_update(chat=[], log_df=initial_log_df, stat=status, json_val="", raw_val="")
+
+    # Helper to log events
+    def add_log_entry(event_name: str, raw_event_dict: Dict[str, Any]):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        try:
+            raw_event_str = json.dumps(raw_event_dict, default=str)
+        except Exception as json_err:
+            _logger.error(f"Failed to serialize event for logging: {json_err}")
+            raw_event_str = f"Error serializing event: {raw_event_dict}"
+        event_log_data.append({"Timestamp": timestamp, "Event": event_name, "Raw Event": raw_event_str})
+        return pd.DataFrame(event_log_data)
+
+    # 2. Check prerequisites
+    if not COGVLM_AVAILABLE:
+        status = "Error: CogVLM components failed to import."
+        _logger.error(status)
+        current_log_df = add_log_entry("Import Error", {"error": status})
+        yield yield_update(log_df=current_log_df, stat=status)
+        return
+    if not query:
+        status = "Error: Query cannot be empty."
+        _logger.warning(status)
+        current_log_df = add_log_entry("Input Error", {"error": status})
+        yield yield_update(log_df=current_log_df, stat=status)
         return
 
-    _logger.info(f"Processing query: '{user_query[:50]}...', Image: {'Yes' if image_input else 'No'}, Schema: {'Yes' if schema_input else 'No'}")
-
-    # --- Input Preparation ---
-    # Append user message to history immediately
-    user_message_display = user_query
-    if image_input:
-        # You could potentially display the image using Markdown later,
-        # but for simplicity, just note its presence.
-        user_message_display += " (Image provided)"
-    chat_history.append((user_message_display, None)) # Placeholder for assistant response
-    yield chat_history, chat_history # Update UI to show user query
-
-    parsed_schema: Optional[Dict[str, Any]] = None
-    if schema_input:
+    # 3. Prepare inputs
+    if schema_str:
         try:
-            parsed_schema = json.loads(schema_input)
-            _logger.info("Schema provided and parsed successfully.")
+            json.loads(schema_str)
+            _logger.info("Schema string appears valid.")
         except json.JSONDecodeError as e:
-            _logger.warning(f"Invalid JSON schema provided: {e}")
-            # Append error message to chat instead of proceeding with bad schema
-            chat_history[-1] = (chat_history[-1][0], f"**Error:** Invalid JSON schema provided. Please correct it.\n\nDetails: `{e}`")
-            yield chat_history, chat_history
-            return # Stop processing this turn
+            schema_error = f"Invalid Schema JSON: {e}."
+            _logger.warning(schema_error)
+            current_log_df = add_log_entry("Schema Warning", {"warning": schema_error})
+            yield yield_update(log_df=current_log_df)
 
-    # --- Streaming Call ---
-    assistant_response = ""
-    finalizer = None # To store the finalizer function
+    max_retries = max(0, int(max_retries_input))
+    system_override = system_prompt_str if system_prompt_str else None
+    seed_response_arg = seed_response_str if seed_response_str is not None else None
 
+    # 4. Instantiate Model Client
     try:
-        # Use the imported request_json_stream function
-        token_iterator, finalizer = request_json_stream(
-            model=client, # Pass the client instance as the model
-            query=user_query,
-            image=image_input, # Pass the PIL image directly
-            schema=parsed_schema, # Pass the parsed schema dict
-            # Add any other inference params if needed via kwargs, e.g.:
-            # max_new_tokens=1024
+        _logger.info("Instantiating CogVLMClient...")
+        model_client = CogVLMClient()
+        _logger.info("CogVLMClient instantiated.")
+    except Exception as e:
+        status = f"Error: Failed to initialize CogVLMClient: {e}"
+        _logger.exception(status)
+        current_log_df = add_log_entry("Init Error", {"error": str(e)})
+        yield yield_update(log_df=current_log_df, stat=status)
+        return
+
+    # 5. Call request_json and stream results
+    status = "Requesting response from model..."
+    yield yield_update(stat=status)
+    try:
+        _logger.info(f"Calling request_json with seed_response: {seed_response_arg!r}")
+        request_iterator = request_json(
+            model=model_client,
+            query=query,
+            image=image_input,
+            extract=extract_flag,
+            schema=schema_str,
+            validate_schema=validate_schema_flag,
+            max_retries=max_retries,
+            system_prmpt_override=system_override,
+            seed_response=seed_response_arg,
         )
 
-        _logger.debug("Streaming started...")
-        for token in token_iterator:
-            assistant_response += token
-            # Update the last element (assistant's turn) in history
-            chat_history[-1] = (chat_history[-1][0], assistant_response)
-            yield chat_history, chat_history # Yield history for Gradio UI update
+        current_assistant_message_content = "" # Track streaming content
 
-        _logger.debug("Streaming finished.")
+        for event in request_iterator:
+            last_event_data = event
+            event_name = event.get('event', 'N/A')
+            _logger.debug(f"Received event: {event_name}, Raw: {event}")
+
+            # Update Event Log first
+            current_log_df = add_log_entry(event_name, event)
+
+            # --- Update Chat Log based on event ---
+            chat_updated = False # Flag to check if chat needs yielding
+
+            if event_name == 'system_prompt':
+                system_prompt_text = event.get('data', '')
+                # Ensure it's added only once at the beginning
+                if not chat_history or chat_history[0]['role'] != SYSTEM_ROLE_NAME:
+                    _logger.info("Adding system prompt to chat history.")
+                    chat_history.insert(0, {"role": SYSTEM_ROLE_NAME, "content": system_prompt_text})
+                    chat_updated = True
+                else:
+                     _logger.debug("System prompt event received, but already present in chat history.")
+
+
+            elif event_name == 'message':
+                event_data = event.get('data')
+                if isinstance(event_data, (list, tuple)) and len(event_data) == 2:
+                    role, content = event_data
+                    role = role.lower() # Normalize role
+
+                    if role == USER_ROLE_NAME:
+                        # Add the user message if it's the first one or a retry
+                        if not initial_user_message_added or content != query:
+                            _logger.info(f"Adding user message to chat history (Initial: {not initial_user_message_added}, Content: '{content[:50]}...')")
+                            chat_history.append({"role": USER_ROLE_NAME, "content": content})
+                            initial_user_message_added = True # Set flag after adding the first one
+                            chat_updated = True
+                        else:
+                             _logger.debug("User message event received, but content matches initial query and already added.")
+
+                    elif role == ASSISTANT_ROLE_NAME:
+                        # Add placeholder and stream content
+                        _logger.info("Adding assistant message placeholder.")
+                        current_assistant_message_content = ""
+                        assistant_message_dict = {"role": ASSISTANT_ROLE_NAME, "content": ""}
+                        chat_history.append(assistant_message_dict)
+                        chat_updated = True # Initial placeholder added
+
+                        # Ensure the placeholder was added correctly before streaming
+                        if not chat_history or chat_history[-1]['role'] != ASSISTANT_ROLE_NAME:
+                             _logger.error("Chat history state error: Failed to add assistant message placeholder correctly.")
+                             # Attempt to recover or skip streaming for this message
+                             chat_history.pop() # Remove potentially wrong placeholder
+                             chat_updated = False # Don't yield update for this broken state
+                        else:
+                            _logger.debug("Streaming assistant response...")
+                            # Stream into the last message dict's content
+                            for char_index, char in enumerate(content):
+                                current_assistant_message_content += char
+                                chat_history[-1]['content'] = current_assistant_message_content
+                                # Yield frequently during streaming
+                                # Avoid logging every single char update unless debugging heavily
+                                # _logger.debug(f"Streaming char {char_index}")
+                                yield yield_update(chat=chat_history, log_df=current_log_df, stat=status)
+                                time.sleep(0.01)
+
+                            _logger.debug("Finished streaming assistant response.")
+                            # No need for chat_updated=True here, already yielded during loop
+                            chat_updated = False # Reset flag as updates were yielded in loop
+                            raw_output = content # Store complete raw response
+                    else:
+                         _logger.warning(f"Received message with unrecognized role: {role}")
+                else:
+                     _logger.warning(f"Received 'message' event with unexpected data format: {event_data}")
+
+            # --- Yield Update ---
+            # Yield updates for log, status, and potentially chat if modified outside streaming loop
+            if chat_updated:
+                 yield yield_update(chat=chat_history, log_df=current_log_df, stat=status)
+            else:
+                 # If only log/status changed, yield that
+                 yield yield_update(log_df=current_log_df, stat=status)
+
+
+        _logger.info("Finished iterating through request_json events.")
 
     except Exception as e:
-        _logger.error(f"Error during streaming inference call: {e}", exc_info=True)
-        error_message = f"**Error during streaming:**\n\n`{e}`"
-        # Update the last message with the error
-        if chat_history: # Ensure history is not empty
-             chat_history[-1] = (chat_history[-1][0], error_message)
-        else: # Should not happen if we append user query first, but safety check
-             chat_history.append((user_query, error_message))
-        yield chat_history, chat_history
-        return # Stop processing this turn
-    finally:
-        # --- Finalization and Post-Stream Processing ---
-        if finalizer:
-            try:
-                _logger.debug("Calling finalizer...")
-                # The finalizer from client.inference returns (final_response_str, final_history_list)
-                # Note: request_json_stream currently just returns the finalizer from client.inference
-                final_response_str, _ = finalizer() # We manage history in Gradio state
-                _logger.info(f"Finalized response length: {len(final_response_str)}")
+        status = f"Runtime Error: {e}"
+        _logger.exception("Error during request processing:")
+        current_log_df = add_log_entry("Runtime Error", {"error": str(e)})
+        if last_event_data is None or last_event_data.get('event') not in ('success', 'failure'):
+            last_event_data = {'event': 'failure', 'error': status}
+            current_log_df = add_log_entry("failure", last_event_data)
+        yield yield_update(log_df=current_log_df, stat=status)
+        return
 
-                # Ensure the final response is reflected in the chat history
-                # (Usually the streamed content should match, but this is safer)
-                if assistant_response.strip() != final_response_str.strip():
-                    _logger.warning("Streamed content differs slightly from finalized response. Updating chat history.")
-                    chat_history[-1] = (chat_history[-1][0], final_response_str)
-                    assistant_response = final_response_str # Use finalized version
-                    yield chat_history, chat_history # Yield final update
+    # 6. Process final result
+    _logger.info("Processing final result...")
+    final_log_df = pd.DataFrame(event_log_data)
 
-                # --- Optional: Post-stream JSON validation ---
-                if parsed_schema:
-                    _logger.info("Attempting post-stream JSON extraction and validation...")
-                    extracted = extract_json(assistant_response)
-                    validation_msg = ""
-                    if extracted:
-                        is_valid, msg = validate_json_schema(extracted, parsed_schema)
-                        if is_valid:
-                            validation_msg = "\n\n*(JSON extracted and schema validation PASSED)*"
-                            _logger.info("Post-stream validation successful.")
-                        else:
-                            validation_msg = f"\n\n*(JSON extracted but schema validation FAILED: {msg})*"
-                            _logger.warning(f"Post-stream validation failed: {msg}")
-                    else:
-                        validation_msg = "\n\n*(Failed to extract JSON from the final response)*"
-                        _logger.warning("Post-stream JSON extraction failed.")
+    if last_event_data:
+        final_event_name = last_event_data.get('event')
+        if final_event_name == 'success':
+            status = "Success"
+            extracted_json = last_event_data.get('json')
+            if extracted_json:
+                try:
+                    json_output = json.dumps(extracted_json, indent=2)
+                except Exception as e:
+                    _logger.error(f"Failed to serialize final JSON: {e}")
+                    json_output = f"Error: Could not display JSON - {e}"
+            raw_output = last_event_data.get('response', raw_output)
+            _logger.info(f"Request finished successfully. JSON extracted: {bool(extracted_json)}")
+        elif final_event_name == 'failure':
+            error_msg = last_event_data.get('error', 'Unknown failure reason')
+            status = f"Failed: {error_msg}"
+            _logger.warning(f"Request failed: {error_msg}")
+            extracted_json = last_event_data.get('json')
+            if extracted_json:
+                 try:
+                    json_output = json.dumps(extracted_json, indent=2)
+                 except Exception as e:
+                    _logger.error(f"Failed to serialize final JSON (on failure): {e}")
+                    json_output = f"Error: Could not display JSON - {e}"
+            raw_output = last_event_data.get('response', raw_output)
+        else:
+            status = f"Finished with unexpected final event: {final_event_name}"
+            _logger.warning(f"Request ended with non-terminal event: {final_event_name}")
+    else:
+        status = "Error: No events received from request function."
+        _logger.error(status)
+        if not any(entry['Event'] == 'Error' and entry['Raw Event'] == json.dumps({"error": status}, default=str) for entry in event_log_data):
+             final_log_df = add_log_entry("Iterator Error", {"error": status})
 
-                    # Append validation status to the assistant's message
-                    chat_history[-1] = (chat_history[-1][0], assistant_response + validation_msg)
-                    yield chat_history, chat_history
-
-            except Exception as e:
-                _logger.error(f"Error during stream finalization or post-processing: {e}", exc_info=True)
-                # Append error to the current assistant message
-                error_msg = f"\n\n**Error during finalization:** `{e}`"
-                chat_history[-1] = (chat_history[-1][0], assistant_response + error_msg)
-                yield chat_history, chat_history
+    # Final update
+    # Ensure the final chat state is yielded correctly
+    _logger.debug(f"Final yield with chat_history: {chat_history}")
+    yield yield_update(chat=chat_history, log_df=final_log_df, stat=status, json_val=json_output, raw_val=raw_output)
+    _logger.info(f"Request processing complete. Final status: {status}")
 
 
-# --- Gradio Interface Definition ---
-with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown(f"""
-    # CogVLM Streaming JSON Chat Demo
-    Interact with the CogVLM model using the `request_json_stream` function.
-    The assistant aims to respond in JSON format, optionally guided by a schema.
-    Server URL: `{SERVER_URL}`
-    """)
-
-    # State to store the conversation history
-    chatbot_state = gr.State([])
+# --- Gradio UI Definition ---
+_logger.info("Defining Gradio UI...")
+with gr.Blocks(theme=gr.themes.Soft(), title=APP_TITLE) as demo:
+    gr.Markdown(f"# {APP_TITLE}")
+    gr.Markdown(
+        "Interact with the CogVLM model. View streamed chat (including system prompt), detailed events, and final JSON output."
+    )
 
     with gr.Row():
-        with gr.Column(scale=2):
-            chatbot_display = gr.Chatbot(
-                label="Conversation",
-                bubble_full_width=False,
-                height=500,
-            )
-            user_query_textbox = gr.Textbox(
-                label="Your Message",
-                placeholder="Type your query here...",
-                lines=3,
-            )
-            with gr.Row():
-                 clear_button = gr.Button("Clear Chat")
-                 submit_button = gr.Button("Send", variant="primary")
-
+        # Inputs Column
         with gr.Column(scale=1):
             gr.Markdown("## Inputs")
-            image_input_box = gr.Image(label="Upload Image (Optional)", type="pil")
-            schema_textbox = gr.Textbox(
-                label="JSON Schema (Optional)",
-                placeholder="Paste your JSON schema here...",
-                lines=10,
-                value=DEFAULT_SCHEMA # Pre-fill with default
+            inp_query = gr.Textbox(
+                label="Query", lines=3,
+                placeholder="Example: Describe the main object in the image as JSON.",
             )
+            inp_image = gr.Image(label="Image (Optional)", type="pil")
 
-    # --- Event Handlers ---
-    submit_button.click(
-        fn=process_chat,
-        inputs=[user_query_textbox, image_input_box, schema_textbox, chatbot_state],
-        outputs=[chatbot_display, chatbot_state],
-        # Note: Clearing inputs happens after fn returns/yields last value
-    ).then(
-        lambda: gr.update(value=""), # Clear query box after processing
-        outputs=[user_query_textbox]
+            gr.Markdown("### JSON Options")
+            inp_schema = gr.Code(
+                label="JSON Schema (Optional)", language="json", lines=8,
+                value='{\n  "type": "object",\n  "properties": {\n    "name": {"type": "string", "description": "Product name"},\n    "id": {"type": "string", "description": "Product ID code"},\n    "stock": {"type": "integer", "minimum": 0},\n    "features": {\n      "type": "array",\n      "items": {"type": "string"}\n    }\n  },\n  "required": ["name", "id", "stock"]\n}',
+            )
+            with gr.Row():
+                inp_extract = gr.Checkbox(label="Extract JSON", value=True, info="Attempt to find JSON in the response.")
+                inp_validate_schema = gr.Checkbox(label="Validate Schema", value=True, info="Validate extracted JSON against the schema (if provided).")
+
+            gr.Markdown("### Advanced Options")
+            inp_max_retries = gr.Number(label="Max Retries", value=1, minimum=0, step=1, precision=0, info="Attempts if JSON extraction or validation fails.")
+            inp_system_prompt = gr.Textbox(label="System Prompt Override (Optional)", lines=2, placeholder="Leave blank for default JSON-focused prompt.")
+            inp_seed_response = gr.Textbox(label="Seed Response (Optional)", lines=2, placeholder="Example: \\n```json\\n{\\n", info="Text to prepend to the model's response generation.", value="\n```json\n{\n")
+
+            submit_btn = gr.Button("Submit Request", variant="primary")
+
+        # Outputs Column
+        with gr.Column(scale=2):
+            gr.Markdown("## Results")
+            out_final_status = gr.Textbox(label="Final Status", interactive=False)
+            with gr.Tabs():
+                with gr.TabItem("Chat Stream", id="chat"):
+                    out_chat_log = gr.Chatbot(
+                        label="Chat Log",
+                        bubble_full_width=False,
+                        height=500,
+                        type="messages" # Ensure type is set
+                    )
+                with gr.TabItem("Event Log"):
+                    out_event_log = gr.DataFrame(
+                        label="Processing Events Log", headers=["Timestamp", "Event", "Raw Event"],
+                        datatype=["str", "str", "str"], interactive=False,
+                        row_count=(15, "dynamic"), wrap=True
+                    )
+                with gr.TabItem("Final Extracted JSON"):
+                    out_final_json = gr.Code(label="Extracted JSON", language="json", lines=20, interactive=False)
+                with gr.TabItem("Final Raw Response"):
+                    out_final_raw = gr.Textbox(label="Complete Raw Model Response", lines=20, interactive=False)
+
+    # --- Connect UI to Logic ---
+    _logger.info("Connecting UI components to processing function...")
+    submit_btn.click(
+        fn=process_request,
+        inputs=[
+            inp_query, inp_image, inp_schema, inp_validate_schema,
+            inp_max_retries, inp_system_prompt, inp_extract, inp_seed_response,
+        ],
+        outputs=[
+            out_chat_log, out_event_log, out_final_status,
+            out_final_json, out_final_raw,
+        ],
     )
 
-    user_query_textbox.submit(
-         fn=process_chat,
-        inputs=[user_query_textbox, image_input_box, schema_textbox, chatbot_state],
-        outputs=[chatbot_display, chatbot_state],
-    ).then(
-        lambda: gr.update(value=""), # Clear query box after processing
-        outputs=[user_query_textbox]
-    )
+_logger.info("Gradio UI definition complete.")
 
-    def clear_chat_history():
-        return [], [] # Clear display and state
-
-    clear_button.click(
-        fn=clear_chat_history,
-        outputs=[chatbot_display, chatbot_state],
-        queue=False # No need to queue simple clear
-    )
-
-
-# --- Launch the App ---
+# --- Launch the Application ---
 if __name__ == "__main__":
-    demo.queue() # Enable queuing for handling multiple users/requests
-    demo.launch(debug=True) # Debug=True provides more logs
+    _logger.info(f"Launching {APP_TITLE}...")
+    demo.launch()
+    _logger.info(f"{APP_TITLE} has shut down.")
+# fmt: on

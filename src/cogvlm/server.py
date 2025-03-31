@@ -1,5 +1,3 @@
-# cogvlm/server.py
-
 import logging
 import argparse
 from typing import List, Optional, Tuple, Dict, Any
